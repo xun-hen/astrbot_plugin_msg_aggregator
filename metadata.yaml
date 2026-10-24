@@ -1,0 +1,34 @@
+name: astrbot_plugin_msg_aggregator
+display_name: 消息聚合
+short_desc: 把用户连发的几条消息合并成一次处理，避免重复调用与上下文割裂
+desc: |-
+  AstrBot 的每条平台消息独立走完整条管线。用户把一句话拆成几条发送时，会产生重复的
+  LLM 调用和割裂的上下文。
+
+  本插件拦截消息、短暂缓冲、再重构为一个事件交给下游，因此：
+  - 3 条消息只触发 1 次处理（私聊与群聊都支持）
+  - 群聊按「会话 + 发送者」分桶，不会把 A 的话并进 B 的上下文
+  - 支持输入状态感知、撤回过滤、图片跨事件保活
+  - 核心零第三方依赖
+
+  群聊有一处平台限制必须知道：只有**已唤醒**的消息（@ 机器人或唤醒前缀）才可见，
+  因此群聊合并仅在每条补充消息都唤醒时生效。详见 README。
+version: v0.1.0
+author: xun-hen
+repo: https://github.com/xun-hen/astrbot_plugin_msg_aggregator
+astrbot_version: ">=4.26"
+social_link: https://github.com/xun-hen
+tags:
+  - 消息
+  - 防抖
+  - 合并
+  - 聚合
+  - 群聊
+  - debounce
+  - aggregate
+help: |-
+  本插件无需指令即可工作。装上后连发几条消息，它们会被合并成一次处理。
+
+  排查用：
+  /aggregator 查看当前聚合状态与统计（也可在插件可视化页查看）
+tags_tip: 本插件默认配置即可用，一般不需要改动配置项。

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 构建产物
+dist/
+*.zip
+!tests/fixtures/*.zip
+
+# 本地数据与运行痕迹
+data/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 备份与临时文件
+*.bak
+*.part
+*.tmp

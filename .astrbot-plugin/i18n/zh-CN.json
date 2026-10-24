@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "display_name": "消息聚合"
+  },
+  "views": {
+    "status": {
+      "title": "运行状态",
+      "description": "查看聚合运行态、合并率、耗时分布与最近处理记录。面板只读，仅支持切换预设与清空统计。",
+      "heading": "运行状态",
+      "live_on": "实时",
+      "live_polling": "轮询中（实时推送不可用）",
+      "live_error": "实时中断，改用轮询",
+      "no_bridge": "当前 Dashboard 不支持插件视图（缺少 bridge），请升级 AstrBot。"
+    }
+  },
+  "pages": {
+    "status": {
+      "title": "运行状态",
+      "description": "查看聚合运行态、合并率、耗时分布与最近处理记录。",
+      "heading": "运行状态",
+      "live_on": "实时",
+      "live_polling": "轮询中（实时推送不可用）",
+      "live_error": "实时中断，改用轮询",
+      "no_bridge": "当前 Dashboard 不支持插件视图（缺少 bridge），请升级 AstrBot。"
+    }
+  }
+}

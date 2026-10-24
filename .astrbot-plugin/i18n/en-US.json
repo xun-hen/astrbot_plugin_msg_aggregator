@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "display_name": "Message Aggregator"
+  },
+  "views": {
+    "status": {
+      "title": "Live status",
+      "description": "Aggregation state, merge ratio, latency distribution and recent rounds. Read-only except preset switching and stats reset.",
+      "heading": "Live status",
+      "live_on": "Live",
+      "live_polling": "Polling (SSE unavailable)",
+      "live_error": "Live stream lost, falling back to polling",
+      "no_bridge": "This Dashboard does not support plugin views (no bridge). Please upgrade AstrBot."
+    }
+  },
+  "pages": {
+    "status": {
+      "title": "Live status",
+      "description": "Aggregation state, merge ratio, latency distribution and recent rounds.",
+      "heading": "Live status",
+      "live_on": "Live",
+      "live_polling": "Polling (SSE unavailable)",
+      "live_error": "Live stream lost, falling back to polling",
+      "no_bridge": "This Dashboard does not support plugin views (no bridge). Please upgrade AstrBot."
+    }
+  }
+}
