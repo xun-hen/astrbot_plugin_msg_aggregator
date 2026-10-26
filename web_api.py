@@ -21,7 +21,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .config import PLUGIN_NAME, PRESET_NAMES
+from .config import HOT_RELOAD_KEYS, PLUGIN_NAME, PRESET_NAMES
 from .observability import log_event, snapshot_state
 
 try:  # pragma: no cover - 老版本没有 api.web 时页面整体降级
@@ -220,6 +220,63 @@ class PageApi:
         self.plugin.stats.reset()
         return json_response({"reset": True, "revision": self.plugin.stats.revision})
 
+    async def api_set_config(self) -> Any:
+        """热更新聚合配置（白名单键，写回插件配置）。
+
+        只接受 `config.HOT_RELOAD_KEYS` 里的键：`enabled` / `page_enabled` 这类会改变
+        插件整体注册状态的项必须重载才生效，混进来只会制造"改了却没生效"的错觉。
+        与 `preset` 一起传时先切预设（写回显式值），再用补丁覆盖。
+
+        Returns:
+            JSON 响应或错误响应。
+        """
+        try:
+            payload = await request.json(default={})
+        except Exception as exc:  # noqa: BLE001
+            return self._bad_request("config", f"invalid body: {exc}")
+        if not isinstance(payload, dict):
+            return self._bad_request("config", "body must be an object")
+        if not payload:
+            return self._bad_request("config", "body must not be empty")
+        unknown = sorted(set(payload) - HOT_RELOAD_KEYS)
+        if unknown:
+            return self._bad_request(
+                "config", f"not hot-reloadable: {', '.join(unknown)}"
+            )
+
+        patch = dict(payload)
+        try:
+            if "preset" in patch:
+                name = validate_preset(patch.pop("preset"))
+                self.plugin.apply_preset(name)
+            if patch:
+                self.plugin.apply_config(patch, persist=True)
+        except ValueError as exc:
+            return self._bad_request("config", str(exc))
+        except Exception as exc:  # noqa: BLE001 - 配置写失败不能影响聚合
+            logger.exception(f"[{PLUGIN_NAME}] 热更新配置失败")
+            return error_response(f"apply config failed: {exc}", status_code=500)
+
+        cfg = self.plugin.cfg
+        log_event("page.config_changed", keys=",".join(sorted(payload)))
+        return json_response(
+            {
+                "applied": sorted(payload),
+                "effective": {
+                    "preset": cfg.preset,
+                    "debounce_time": cfg.debounce_time,
+                    "adaptive": cfg.adaptive,
+                    "adaptive_min_wait": cfg.adaptive_min_wait,
+                    "adaptive_max_wait": cfg.adaptive_max_wait,
+                    "adaptive_max_total_wait": cfg.adaptive_max_total_wait,
+                    "group_enabled": cfg.group_enabled,
+                    "typing_detection": cfg.typing_detection,
+                    "recall_filter": cfg.recall_filter,
+                    "interrupt_wait": cfg.interrupt_wait,
+                },
+            }
+        )
+
     # ------------------------------------------------------------------ SSE
     async def api_events(self) -> Any:
         """SSE：按 `page_push_interval` 推送摘要，**变化才推**（§24.4）。
@@ -275,6 +332,7 @@ ROUTES = (
     ("/{plugin}/rounds", "api_rounds", ("GET",), "Live rounds"),
     ("/{plugin}/history", "api_history", ("GET",), "Flush history"),
     ("/{plugin}/preset", "api_preset", ("GET",), "Current preset"),
+    ("/{plugin}/config", "api_set_config", ("POST",), "Hot-reload config"),
     ("/{plugin}/events", "api_events", ("GET",), "SSE summary"),
 )
 

@@ -23,6 +23,7 @@
 | **v0.7** | 五轮评审。**P0-1** `_finalize` 只在入口检查 `shutting_down`，`enrich` 期间被 abort/shutdown 后仍会 `reconstruct` 放行半成品 → 新增 **I18：每个 `await` 之后必须重新检查**，并明确"为什么不做 `finalize_task` 取消"（11.2）。**P1-1** `DebounceTimer._cancel` 会自取消（timer/watchdog 自己触发 `_on_fire`）→ 跳过当前任务。**P1-2** `_on_typing` 硬编码中文文案 → 改为结构化优先 + 文案 fallback + 无法判定即 no-op。**P1-3** 门禁口径统一为 17 条、M2.5 上调至 1.0 人日。P2 七条并入（`dedupe` 移到 normalize 之后、`_on_recall` 实现、`typing` 复位、`end_finalize` 幂等短路等） |
 | **v0.8** | 六轮评审：**补两处一直悬空的东西**。(1) **本地统计（§19.2）**：§2 把 A2/A3 的采集方式写成"本地计数"，却从未规格化，§23-Q3 又自认"遥测缺失导致 A1/A3 不可量化"——本版把计数口径、维度上限、落盘时机、隐私红线补齐，并把 `snapshot_state()` 从"瞬时快照"扩展为"快照 + 累计 + 环形历史"。(2) **插件可视化页面（§24）**：把 §5 里 P2 的"可视化面板"提到 P1 并定案（解决 §23-Q2），落成 `pages/status/` + `register_web_api` + bridge 的完整规格。两处都守住"核心零依赖 / 只用公开 API / 失败可见"。附带核实 4.28.1 与 master 的页面差异（目录名 `pages` vs `views`、i18n 键 `pages.*` vs `views.*`），两者**同时写**才能跨版本正确 |
 | **v0.9** | 七轮评审：**从根源修复"优先级不足"（§25）**。原方案把 `priority=50` 当作"够高"，但派发循环是 `if event.is_stopped(): break`，且排序键没有上限——于是"够不够"随用户装了什么插件而变，是**无法证明已解决**的问题。本版三件事：① 优先级取插件层顶格 `1000`（说明为何不用 `sys.maxsize`：内置会话控制正是该值，并列胜负取决于注册顺序）；② 新增不在派发循环内的 `OnLLMRequestEvent` 抢占检测——**把"静默不工作"变成"可见降级"**（`aggregate.preempted` + `preempted_total`）；③ 明确被抢占不留半成品。核心判断：**从"赌自己先跑"改成"输了也一定知道"** |
+| **v0.9.1 / v1.1.0（插件 v0.1.1）** | 把话题路由器整合版的四处聚合层修正搬回独立版：① **抢占判据收窄**——只在"本次 `activated_handlers` 里有本插件、但入口没执行"时报，合成事件（主动回复 / 别家 `request_llm` / Agent 重放）不再误报，告警带 `dispatched`/`position`/`prior` 证据（§25.4）；② **未完句加成**——句末不是终止标点时 +1.0s，短句有效窗口 2.5s → 3.5s，并记下"用空串当未完句替身"会让回归失效的坑（§8.4）；③ **预设写回**——切预设后把显式值写回配置并 `save_config()`，重载不再回退（§15.1）；④ **配置热更新**——`apply_config()` + `POST {p}/config`（白名单），进行中的轮次用旧值走完（§24.3） |
 
 > **v0.7 的核心判断**：前六版的所有不变式都建立在"Owner 只在两个离散点（`_after_flush`、`_finalize` 入口）检查放弃标志"这一假设上。**一旦 `_finalize` 内部有 `await`，这个假设就失效**——而 `enrich` 恰恰是一个最长 12s 的 `await`。这条缺口只在装了增强包时暴露，恰好是"默认配置下测不出来"的那类。本版把检查点下沉到每个 `await` 之后，并把"放弃"从"设标志"升级为"可达所有 await 的契约"。
 
@@ -208,6 +209,8 @@ def compute(self, rnd: Round, now: float, cooldown_remaining: float) -> float:
       1. 非自适应 → w = cfg.debounce_time；
          自适应 → 按长度分档 + 结尾标点 + 连续短句加成，clamp 到
          [adaptive_min_wait, adaptive_max_wait]；
+         结尾标点三档：开放标点（，、；：）+0.5；终止标点（。！？.!?…）-0.4；
+         **其余（句末不是终止标点）+1.0**；
       2. 总上限：w = min(w, started_at + adaptive_max_total_wait - now)；
       3. cooldown：w = max(w, cooldown_remaining)（仅当 debounce < min_interval 时生效，10.2）。
 
@@ -215,6 +218,15 @@ def compute(self, rnd: Round, now: float, cooldown_remaining: float) -> float:
         等待秒数；<= 0 表示应立即结算（调用方直接 `_on_fire(rnd)`）。
     """
 ```
+
+> **第 3 档为什么必须存在**：中文聊天里绝大多数消息**不以标点结尾**（"帮我看看 NAS 硬盘"），
+> 而这正是"话可能还没说完"的最强信号。旧规则只给"句末是逗号"加时间，短句有效窗口只有
+> `2.0 + 0.5 = 2.5s`，而实测相邻消息间隔是 `2.4~3.9s`——每次都差一点点。加上 1.0s 后窗口变成
+> `3.5s`，同时句号/问号/感叹号收尾仍走 `-0.4`，不会被拖慢。
+>
+> **实现坑（必须记住）**：首次实现把它写成"`tail_char` 为空才加成"。但 `tail_char` 是最后一条
+> **非空**文本的末字符，正常消息永远非空，所以加成从未生效——现场扫窗口量到 2.5s 才发现。
+> 回归用例**不能用空串**代表"未完句"，必须用真实字符（如「略」），否则测试会放过这个 bug。
 
 ## 9. 数据模型
 
@@ -941,6 +953,12 @@ Enricher **并行**执行（`asyncio.gather` + `asyncio.timeout`），消除"`ma
 
 预设只覆盖 `debounce_time` / `adaptive` / `adaptive_max_wait` / `adaptive_max_total_wait`，其余保持默认；切换后落成显式值（便于排障时看到真实生效值）。
 
+**切预设必须写回配置（v0.9.3）**：`apply_preset()` 算出生效值后，经 `persist_preset` 回调把
+**那几项显式值 + `preset`** 写进插件配置对象并 `save_config()`。只改内存的话，页面显示
+`patient`、重载插件后又变回 `balanced`，配置表单里也一直是旧值——现场踩过。写回失败不影响
+本次生效，只记一条 warning。写显式值而不是只写 `preset`，是为了即使以后调整预设表，用户
+此刻的窗口也不会被悄悄改掉。
+
 ### 15.2 单一默认值来源
 
 ```python
@@ -1084,6 +1102,8 @@ class Config:
 | `aggregate.abort` | warning | `key`, `round_id`, `cause`（`cancelled`/`shutdown`/`interrupt_timeout`/`finalize_failed`）— 每轮最多一条 |
 | `aggregate.stale_timer` | debug | `key`, `round_id` — 计时器复用后应罕见 |
 | `aggregate.interrupt_timeout` | warning | `key`, `pending`（被 abort 的轮次数） |
+| `aggregate.preempted` | warning | `umo`, `priority`, `dispatched`（派发计划总数）, `position`（本插件下标）, `msg_id`, `prior`（紧挨在前的最多 3 个 `handler@priority`）, `hint`（§25.4） |
+| `page.config_changed` | info | `keys` — 页面热更新了哪些配置项（§24.3） |
 | `attach.persist_failed` | warning | `ref`, `reason` |
 | `attach.quota_exceeded` | warning | `key`, `committed_bytes`, `limit` |
 | `capability.missing` | warning | `name`, `fallback`, `hint` |
@@ -1336,7 +1356,8 @@ def snapshot_state(self) -> list[dict]:
 | 21 | **落盘原子与失败降级** | 落盘期间 `os.replace` 抛错 → 只 `stats.persist_failed` warning、`end_finalize` 正常返回、聚合不受影响；正常路径重启后计数恢复；(版本号不匹配 → 丢弃重建) |
 | 22 | **隐私红线** | 让消息带可识别的哨兵串（如 `SENTINEL-7f3a`）跑完整轮 → `stats.json` 与 `StatsSnapshot.history` 的**任何字段都不含该串**；`umo`/`sender` 长度已按上限截断 |
 | 23 | **页面 API 与 SSE 节流** | `GET /stats?limit=99999` → clamp 到上限；`POST /preset` 传非法名 → 400 且配置未变；`POST /stats/reset` 缺确认串 → 400；`page_push_interval=1.0` 下 1s 内触发 5 次结算 → 只推 1 次；`revision` 不变时**不推**；`page_enabled=False` → 路由未注册（404） |
-| 24 | **抢占检测（§25）** | ① 已被本插件处理过的消息 → **不误报**；② 未处理且本该处理的消息 → `preempted_total` +1，**重复检测不重复计数**；③ 空消息 / 指令 / `input_status` / 撤回通知 / 群聊已关闭 → **一律不误报**；④ `MESSAGE_PRIORITY >= 1000`；⑤ 用真实注册表断言 `aggregate_on_llm_request` 挂在 `OnLLMRequestEvent` 上（不在派发循环内，优先级挡不住） |
+| 24 | **抢占检测（§25）** | ① 已被本插件处理过的消息 → **不误报**；② 派发计划里有本插件、但入口未执行 → `preempted_total` +1，**重复检测不重复计数**；③ 合成事件（没有 `activated_handlers`）、派发计划里没有本插件 → **不误报**；④ 空消息 / 指令 / `input_status` / 撤回通知 / 群聊已关闭 / 插件整体关闭 → **一律不误报**；⑤ 告警证据含 `dispatched`/`position`/`prior`；⑥ `MESSAGE_PRIORITY >= 1000`；⑦ 用真实注册表断言 `aggregate_on_llm_request` 挂在 `OnLLMRequestEvent` 上（不在派发循环内，优先级挡不住） |
+| 25 | **配置写回与热更新（v0.1.1）** | ① 切预设后写回配置对象并触发 `save_config()`；② 用写回后的配置重载仍是新预设；③ 自定义 `persist_preset` 可覆盖默认写回；④ `apply_config` 同步挂到 `store`/`stats`/`attachments`，`persist=True` 才回写；⑤ 非法值按 `validate` 回退而不是抛异常 |
 
 ## 21. 采用策略（M4/M5 验收项）
 
@@ -1431,8 +1452,11 @@ def snapshot_state(self) -> list[dict]:
 | GET | `{p}/history` | 最近 N 条 `FlushRecord` | 默认 50；**非整数 → 400**；**越界 → clamp** 到 `[1,200]` |
 | GET | `{p}/preset` | 当前预设 + 生效关键值 | — |
 | POST | `{p}/preset` | 切换预设 | 白名单 `{fast,balanced,patient}`，否则 **400** |
+| POST | `{p}/config` | 热更新配置（v1.1.0） | 只接受 `config.HOT_RELOAD_KEYS` 白名单，越界键 **400**；空 body **400** |
 | POST | `{p}/stats/reset` | 清零统计 | body 必须含 `{"confirm":"reset"}`，否则 **400** |
 | GET | `{p}/events` | SSE 摘要推送 | 见 §24.4 |
+
+**热更新白名单为什么是白名单而不是黑名单**：`enabled` / `page_enabled` 会改变插件整体的注册与页面生命周期，必须重载才生效；放进来只会制造"看起来改了、实际没生效"的错觉。白名单外的键一律 **400**，让前端 bug 当场暴露。热更新只换 `Config` 并挂回 `store`/`stats`/`attachments`：**进行中的轮次用旧值走完，新轮次用新值**。
 
 **校验口径的取舍**（这里最容易写错）：`limit` 越界**clamp 而不是 400**——用户只是想多要点，不是错；但 `limit` 非整数**必须 400**——那是前端 bug，静默 clamp 会把 bug 藏起来。`preset` 与 `reset` 都会**改变状态**，所以一律拒绝而不是容错。
 
@@ -1617,15 +1641,22 @@ async def aggregate_on_llm_request(event, *_a, **_kw):
 
 它不做聚合（消息已被别人消费，没得聚），只回答一个问题：**这条本该由我处理的消息，我到底处理了吗？**
 
-判定靠事件对象上的一个标记（同一条消息在整条管线里是同一个事件实例，属性随事件回收、不泄漏）：
+判定靠两样东西：① 事件对象上的标记（同一条消息在整条管线里是同一个事件实例，属性随事件回收、不泄漏）；② **本次派发计划** `activated_handlers`（`WakingCheckStage` 在派发前写入，已按优先级降序）。**只有"计划里有本插件、标记却缺失"才算抢占。**
 
 | 状态 | 含义 | 动作 |
 | --- | --- | --- |
 | 有标记 | 我的 handler 执行过 | 什么都不做 |
-| 无标记 + 本该由我处理 | **被抢占** | `aggregate.preempted` 警告 + `preempted_total += 1` |
-| 无标记 + 本不该我处理 | 正常旁路 | 什么都不做 |
+| 无标记 + 派发计划里有我 | **被抢占** | `aggregate.preempted` 警告 + `preempted_total += 1` |
+| 无标记 + 派发计划里没有我 | 合成事件（主动回复 / 别家 `request_llm` / Agent 重放） | 什么都不做 |
+| 无标记 + 计划里有我，但本不该我处理 | 正常旁路 | 什么都不做 |
 
-"本该由我处理"必须**保守**判定，否则会制造噪音告警。排除项：群聊被关闭、空消息、指令、`input_status`/撤回通知。宁可漏报，不可误报——误报会让这个机制在两天内被人关掉。
+> **v0.9.1 修正**：v0.9.0 的判据是"有内容 + 无标记 = 抢占"，把正常行为报成了故障——
+> `OnLLMRequestEvent` 会被主动回复、其它插件直接 `request_llm()`、Agent 内部重放等
+> **合成请求**触发，它们本来就不在派发计划里。新判据把它们排除；告警同时带
+> `dispatched`（计划总数）、`position`（本插件下标）、`prior`（紧挨在前的最多 3 个
+> `handler@priority`），下一次不必再猜是谁挡的。
+
+"本该由我处理"还必须**保守**判定，否则会制造噪音告警。其余排除项：群聊被关闭、空消息、指令、`input_status`/撤回通知。宁可漏报，不可误报——误报会让这个机制在两天内被人关掉。
 
 **第 3 层：被抢占时不留半成品**
 
@@ -1656,8 +1687,12 @@ async def aggregate_on_llm_request(event, *_a, **_kw):
 
 - 单测 `[14] 抢占检测`：
   - 已处理过的消息**不误报**；
-  - 未处理的消息 → 计数 +1，且**重复检测不重复计数**（幂等）；
-  - 空消息 / 指令 / 通知事件 / 群聊关闭 → **均不误报**；
+  - **派发计划里有本插件、但入口未执行** → 计数 +1，且**重复检测不重复计数**（幂等）；
+  - **合成事件（没有 `activated_handlers`）、派发计划里没有本插件** → **不误报**（v0.9.1 判据）；
+  - 空消息 / 指令 / 通知事件 / 群聊关闭 / **插件整体关闭**（handler 仍在派发计划里，
+    但 `handle` 本身不执行）→ **均不误报**（这些用例都带上派发计划，
+    否则测到的只是"不在计划里"的短路）；
+  - 告警证据含 `dispatched` / `position` / `prior`，且 `prior` 只取紧挨在前的最多 3 个；
   - `MESSAGE_PRIORITY >= 1000`；
   - 用真实注册表断言钩子确实挂在 `OnLLMRequestEvent` 上。
 - 现场验证：真机上若 `preempted_total > 0`，页面直接给出"有 N 条消息未被聚合"的提示，日志里可 grep `aggregate.preempted` 拿到 UMO。

@@ -13,7 +13,7 @@ desc: |-
 
   群聊有一处平台限制必须知道：只有**已唤醒**的消息（@ 机器人或唤醒前缀）才可见，
   因此群聊合并仅在每条补充消息都唤醒时生效。详见 README。
-version: v0.1.0
+version: v0.1.1
 author: xun-hen
 repo: https://github.com/xun-hen/astrbot_plugin_msg_aggregator
 astrbot_version: ">=4.26"

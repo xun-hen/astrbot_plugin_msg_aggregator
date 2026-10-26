@@ -20,6 +20,21 @@ _MID_BONUS = 0.8
 _SHORT_BONUS = 0.5
 _STREAK_BONUS = 0.5
 _TERMINAL_DISCOUNT = 0.4
+_UNFINISHED_BONUS = 1.0
+"""句末不是终止标点时的加成（对照话题路由器 v0.9.3 引入、v0.9.4 修正生效条件）。
+
+中文聊天里绝大多数消息**不以标点结尾**（"帮我看看 NAS 硬盘"），而这恰恰是
+"话可能还没说完、下一条马上就来"的最强信号。旧规则只给"句末是逗号"加时间，
+于是连发的消息总是差 0.3~1 秒落在窗口外，聚合看起来像没生效。
+
+实测：连发的相邻消息间隔常见 2.4~3.9 秒，而旧窗口只有 2.0~2.5 秒。加这 1.0 秒后，
+短句的有效窗口变成 2.0 + 0.5 + 1.0 = 3.5 秒，刚好覆盖；同时**不拖慢**已经用
+句号/问号/感叹号收尾的句子（那类仍走 -0.4 的折减）。
+
+> 首次实现曾把条件写成"`tail_char` 为空才加"，而空串只出现在整轮没有文本的时候
+> ——等于这个加成从未生效。正确条件是"句末字符**不属于终止标点**"，所以下面的
+> 回归用例必须用真实字符（如「略」），不能拿空串当"未完句"的替身。
+"""
 
 
 def adaptive_wait(
@@ -50,11 +65,15 @@ def adaptive_wait(
         # 短句：用户很可能还在边想边打，多留一点时间
         wait += _SHORT_BONUS
 
-    if tail_char:
-        if tail_char in _OPEN_PUNCT:
-            wait += _SHORT_BONUS
-        elif tail_char in _TERMINAL_PUNCT:
-            wait -= _TERMINAL_DISCOUNT
+    if tail_char in _OPEN_PUNCT:
+        wait += _SHORT_BONUS
+    elif tail_char in _TERMINAL_PUNCT:
+        wait -= _TERMINAL_DISCOUNT
+    else:
+        # 句末不是终止标点（中文聊天里最常见："帮我看看 NAS 硬盘"），按未完句多等一点。
+        # 注意：这里**不是**"tail_char 为空"——空串只表示整轮没有文本，
+        # 按空串判断会让加成永远不生效（v0.9.3 踩过的坑）。
+        wait += _UNFINISHED_BONUS
 
     if short_streak >= 2:
         wait += _STREAK_BONUS

@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -56,6 +56,14 @@ MARKER_ATTR = "_msg_agg_seen"
 
 SHUTDOWN_GRACE = 2.0
 """shutdown 时等待进行中轮次收尾的秒数。"""
+
+MESSAGE_HANDLER_NAME = "aggregate_on_event"
+"""消息入口 handler 的函数名。
+
+AstrBot 用 `handler.__name__` 填 `StarHandlerMetadata.handler_name`，而本插件的入口是
+**模块级函数** `aggregate_on_event`（原因见模块 docstring）。抢占检测要拿它去核对
+`activated_handlers`：在计划里 = 这条消息本该派发给我们。
+"""
 
 _INSTANCE: "MsgAggregator | None" = None
 
@@ -119,16 +127,37 @@ async def aggregate_on_event(event: AstrMessageEvent) -> None:
 class MsgAggregator(Star):
     """消息聚合插件。"""
 
-    def __init__(self, context: Context, config: dict | None = None) -> None:
+    def __init__(
+        self,
+        context: Context,
+        config: dict | None = None,
+        *,
+        message_handler_name: str = MESSAGE_HANDLER_NAME,
+        persist_preset: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         """初始化。
 
         Args:
             context: AstrBot 上下文。
-            config: 插件配置。
+            config: 插件配置。生产环境是 `AstrBotConfig`（dict 子类，带
+                `save_config()`），测试里可能是普通 dict。
+            message_handler_name: 消息入口 handler 的函数名，抢占检测用它核对
+                "本次派发计划里有没有我们"。传空串等于关掉抢占检测。
+            persist_preset: 切预设后把显式值写回插件配置的回调。缺省用自带的
+                `_persist_config`（写回配置对象并 `save_config()`）。
+                v0.1.0 只改内存里的 `Config`，重载插件就悄悄回到旧预设。
         """
         super().__init__(context)
         global _INSTANCE
         _INSTANCE = self
+
+        # 原始配置对象要**单独留一份引用**：写回时既要更新值，也要能调 save_config()。
+        # 不要 dict(config) 复制——那会丢掉 AstrBotConfig 的方法。
+        self._config_obj: dict[str, Any] = config if isinstance(config, dict) else {}
+        self.message_handler_name = message_handler_name
+        self.persist_preset: Callable[[dict[str, Any]], None] | None = (
+            persist_preset or self._persist_config
+        )
 
         self.cfg: Config = load_config(config)
         self.clock = RealClock()
@@ -620,11 +649,45 @@ class MsgAggregator(Star):
             self.store.abort(rnd, cause="exception")
             self._silence(event, cause="failed")
 
-    def _should_have_handled(self, event: AstrMessageEvent) -> bool:
-        """判断"这条消息本来该由本插件处理"。
+    def _dispatch_snapshot(self, event: AstrMessageEvent) -> tuple[list[Any], int]:
+        """取"这次派发计划里有哪些 handler"以及本插件在其中的位置。
 
-        只用于抢占检测，所以刻意**保守**：宁可漏报，也不要对"我们本来就不该处理"
-        的消息误报（群聊关闭、空消息、指令、notice 事件都排除）。
+        这是抢占检测从"猜"变成"可证"的关键：`activated_handlers` 由
+        `WakingCheckStage` 在派发前写进事件，里面是**这次真的会被调用的** handler
+        （已按优先级降序）。如果我们的 handler 不在里面，说明这条事件根本没被派发
+        给我们（例如主动回复、其它插件直接 `request_llm()` 的合成事件、Agent 重放），
+        不能叫"被抢占"——那正是 v0.9.0 判据（有内容 + 无标记 = 抢占）误报的来源。
+
+        Args:
+            event: 消息事件。
+
+        Returns:
+            `(handlers, self_index)`；`self_index` 为 -1 表示不在派发计划里。
+        """
+        if not self.message_handler_name:
+            # 显式关闭抢占检测（集成方没有 handler 名的概念时用）。
+            # 不能靠"空串去 index()"：万一某个 handler 的名字也是空的就会误判。
+            return [], -1
+        try:
+            handlers = list(event.get_extra("activated_handlers") or [])
+        except Exception:  # noqa: BLE001 - 老版本/测试替身可能没有 get_extra
+            return [], -1
+        names = [str(getattr(handler, "handler_name", "") or "") for handler in handlers]
+        try:
+            index = names.index(self.message_handler_name)
+        except ValueError:
+            index = -1
+        return handlers, index
+
+    def _should_have_handled(self, event: AstrMessageEvent) -> bool:
+        """判断"这条消息本来该由本插件处理"（抢占检测用，刻意保守）。
+
+        必要条件：本插件的消息 handler **在这次的 `activated_handlers` 里**。
+        合成事件没有这份派发计划，或计划里没有我们，都不能计为抢占——否则会把
+        主动回复、其它插件发起的 LLM 请求报成故障，**误报比漏报更糟**：
+        它会让人在两天内把这个机制关掉。
+
+        其余排除项：群聊关闭、空消息、指令、`input_status`/撤回通知。
 
         Args:
             event: 消息事件。
@@ -632,6 +695,14 @@ class MsgAggregator(Star):
         Returns:
             True 表示如果没被抢占，本插件本应处理它。
         """
+        _handlers, index = self._dispatch_snapshot(event)
+        if index < 0:
+            return False
+        # 插件整体关闭 / 正在卸载时，`handle` 本来就会在入口直接返回；
+        # 但 handler 仍注册在派发计划里（注册发生在 import 时），不排除就会
+        # 把"用户主动关掉插件"刷成满屏 aggregate.preempted。
+        if not self.cfg.enabled or self._shutting_down:
+            return False
         if caps_mod.is_typing_notice(event) or caps_mod.is_recall_notice(event):
             return False
         if not self._accepts(event):
@@ -644,19 +715,30 @@ class MsgAggregator(Star):
         except Exception:  # noqa: BLE001
             return False
 
-    def check_preempted(self, event: AstrMessageEvent) -> None:
+    def check_preempted(self, event: AstrMessageEvent) -> bool:
         """抢占检测：本该处理却没处理到，说明被更高优先级者挤掉了。
 
         **不做任何补救动作**（补救会和对方抢，反而更乱），只做三件事：告警、计数、
-        给一条可执行的建议。这样"优先级不足"从静默故障变成可观测现象。
+        给出**可证伪的证据**。告警里带上派发计划总数、本插件的位置、以及紧挨在
+        前面最多 3 个 handler，下一次不必再猜是谁挡的。
 
         Args:
             event: 消息事件。
+
+        Returns:
+            True 表示这次确实判定为被抢占（调用方可据此落 trace 证据）。
         """
         if getattr(event, MARKER_ATTR, False):
-            return
+            return False
         if not self._should_have_handled(event):
-            return
+            return False
+        handlers, index = self._dispatch_snapshot(event)
+        prior: list[str] = []
+        for handler in handlers[:index][-3:]:
+            priority = (getattr(handler, "extras_configs", None) or {}).get(
+                "priority", "?"
+            )
+            prior.append(f"{getattr(handler, 'handler_name', '?')}@{priority}")
         # 打上标记，避免同一事件因多次钩子调用重复告警
         try:
             setattr(event, MARKER_ATTR, True)
@@ -669,12 +751,18 @@ class MsgAggregator(Star):
             "aggregate.preempted",
             umo=umo,
             priority=MESSAGE_PRIORITY,
+            dispatched=len(handlers),
+            position=index,
+            msg_id=getattr(getattr(event, "message_obj", None), "message_id", "?"),
+            prior=",".join(prior) or "(none)",
             hint=(
-                "本条消息未被聚合：有执行者在本插件的消息入口之前静默了事件"
-                "（通常是 priority 更高，或框架内置的会话控制 handler）。"
-                "可查插件列表里 priority 大于本插件的插件；本插件自身已无更高可用优先级"
+                "本条消息未进入聚合：派发计划里有本插件，但入口没被执行"
+                "（通常是排在前面的 handler 静默了事件）。"
+                "prior= 是紧挨在本插件前面的执行者；若 position=0 仍被跳过，"
+                "说明事件在派发循环之外被消费"
             ),
         )
+        return True
 
     def state_rows(self) -> list[dict[str, Any]]:
         """页面用的状态行（转发到 observability，保持页面只依赖一个入口）。
@@ -685,7 +773,10 @@ class MsgAggregator(Star):
         return snapshot_state(self.store)
 
     def apply_preset(self, name: str) -> dict[str, Any]:
-        """切换预设并落到运行中的配置上。
+        """切换预设并落到运行中的配置上，同时**写回插件配置**。
+
+        只改内存的话，页面显示 `patient`，重载插件/重启 AstrBot 后又变回 `balanced`，
+        配置表单里也一直是旧值（现场踩过）。写回失败不影响本次生效，只记 warning。
 
         Args:
             name: 预设名（已由调用方校验）。
@@ -697,18 +788,94 @@ class MsgAggregator(Star):
 
         if name not in PRESET_NAMES:
             raise ValueError(f"unknown preset: {name}")
-        self.cfg = validate(_apply(_replace_preset(self.cfg, name)))
-        self.store.cfg = self.cfg
-        self.stats.cfg = self.cfg
-        self.attachments.cfg = self.cfg
+        self._install_config(validate(_apply(_replace_preset(self.cfg, name))))
         effective = dict(PRESETS[name])
         logger.info(f"[{PLUGIN_NAME}] 预设已切换为 {name}：{effective}")
+
+        # 写回"显式值"而不是只写 preset：这样即使以后调整了预设表，
+        # 用户此刻的窗口也不会被悄悄改掉（与话题路由器 v0.9.3 一致）。
+        applied: dict[str, Any] = {
+            key: getattr(self.cfg, key) for key in PRESETS[name]
+        }
+        applied["preset"] = self.cfg.preset
+        persist = self.persist_preset
+        if callable(persist):
+            try:
+                persist(applied)
+            except Exception as exc:  # noqa: BLE001 - 写配置失败不能影响聚合
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 预设写回配置失败（本次仍生效）："
+                    f"{type(exc).__name__}: {exc}"
+                )
+
         return {
             "debounce_time": self.cfg.debounce_time,
             "adaptive": self.cfg.adaptive,
             "adaptive_max_wait": self.cfg.adaptive_max_wait,
             "adaptive_max_total_wait": self.cfg.adaptive_max_total_wait,
         }
+
+    def apply_config(self, raw: dict[str, Any] | None, *, persist: bool = False) -> None:
+        """热更新聚合配置（改了聚合配置后不必重载插件）。
+
+        只重算 `Config` 并挂回各子模块：**进行中的轮次继续用旧值走完，新轮次用新值**，
+        不打断用户正在等的回复。
+
+        Args:
+            raw: 配置补丁；`None` 表示按当前配置对象重算一遍。
+            persist: 是否把补丁写回插件配置对象（页面接口用；默认只改内存）。
+        """
+        merged = self._config_snapshot()
+        if isinstance(raw, dict):
+            merged.update(raw)
+        self._install_config(load_config(merged))
+        # A3 的"留存"口径要跟着新配置重算（哈希不同会被忽略，不会误记）
+        self.stats.track_config(stats_mod.config_hash(self.cfg))
+        logger.info(f"[{PLUGIN_NAME}] 聚合配置已热更新 {describe_effective(self.cfg)}")
+
+        if persist and isinstance(raw, dict):
+            try:
+                self._persist_config(dict(raw))
+            except Exception as exc:  # noqa: BLE001 - 写配置失败不能影响聚合
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 热更新配置写回失败（本次仍生效）："
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    def _install_config(self, cfg: Config) -> None:
+        """把一份新配置挂到所有使用方（唯一入口，避免某处漏更新）。
+
+        Args:
+            cfg: 已校验的配置。
+        """
+        self.cfg = cfg
+        self.store.cfg = cfg
+        self.stats.cfg = cfg
+        self.attachments.cfg = cfg
+
+    def _config_snapshot(self) -> dict[str, Any]:
+        """当前原始配置的浅拷贝（热更新合并的基线）。
+
+        Returns:
+            配置字典；没有配置对象时返回空字典。
+        """
+        return dict(self._config_obj) if isinstance(self._config_obj, dict) else {}
+
+    def _persist_config(self, values: dict[str, Any]) -> None:
+        """把显式值写回插件配置对象并落盘。
+
+        生产环境里 `config` 是 `AstrBotConfig`（dict 子类）且带同步的
+        `save_config()`；测试/老版本没有这个方法时只更新内存，不报错。
+
+        Args:
+            values: 要写回的键值（只写显式生效值，不写默认值）。
+        """
+        if not isinstance(self._config_obj, dict):
+            return
+        self._config_obj.update(values)
+        save = getattr(self._config_obj, "save_config", None)
+        if callable(save):
+            save()
 
     def _data_dir(self) -> str:
         """插件数据目录（优先 AstrBot 提供的路径，缺失则回退 ~/.astrbot）。

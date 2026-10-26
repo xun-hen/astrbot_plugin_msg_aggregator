@@ -52,6 +52,34 @@ LEGACY_ALIASES: dict[str, str] = {
     "max_wait": "adaptive_max_total_wait",
 }
 
+HOT_RELOAD_KEYS: frozenset[str] = frozenset(
+    {
+        "preset",
+        "debounce_time",
+        "adaptive",
+        "adaptive_min_wait",
+        "adaptive_max_wait",
+        "adaptive_max_total_wait",
+        "short_message_threshold",
+        "separator",
+        "group_enabled",
+        "min_interval_group",
+        "min_interval_private",
+        "typing_detection",
+        "max_typing_wait",
+        "recall_filter",
+        "interrupt_wait",
+        "preserve_part_order",
+        "command_prefixes",
+    }
+)
+"""允许页面**热更新**的配置项（白名单，不是黑名单）。
+
+`enabled` / `page_enabled` 会改变插件整体的注册与页面生命周期，必须重载才生效；
+把它们的进热更新只会制造"看起来改了、其实没生效"的错觉，所以排除在外。
+统计/缓存相关项只影响后台任务节奏，没有热改的必要，也一并排除。
+"""
+
 
 @dataclass(slots=True)
 class Config:

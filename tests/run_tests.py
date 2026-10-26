@@ -170,8 +170,30 @@ class FakeEvent:
             raw=raw,
         )
         self.stopped = False
+        self._extras: dict[str, Any] = {}
 
     # --- 事件契约 ---
+    def get_extra(self, key: str, default: Any = None) -> Any:
+        """读取事件附加数据（与 `AstrMessageEvent.get_extra` 同名同语义）。
+
+        Args:
+            key: 键。
+            default: 缺省值。
+
+        Returns:
+            值。
+        """
+        return self._extras.get(key, default)
+
+    def set_extra(self, key: str, value: Any) -> None:
+        """写入事件附加数据。
+
+        Args:
+            key: 键。
+            value: 值。
+        """
+        self._extras[key] = value
+
     def stop_event(self) -> None:
         """停止传播。"""
         self.stopped = True
@@ -288,13 +310,14 @@ MAIN: Any = None
 
 
 def make_plugin(tmp_root: Path, config: dict | None = None,
-                clock: Any = None) -> Any:
+                clock: Any = None, **kwargs: Any) -> Any:
     """构造插件实例并把数据目录指向临时路径。
 
     Args:
         tmp_root: 临时目录。
         config: 配置覆盖。
         clock: 时间源。
+        **kwargs: 透传给插件构造函数的其余参数（如 `persist_preset`）。
 
     Returns:
         插件实例。
@@ -302,7 +325,7 @@ def make_plugin(tmp_root: Path, config: dict | None = None,
     data_dir = tmp_root / "plugin_data" / PLUGIN_DIR.name
     data_dir.mkdir(parents=True, exist_ok=True)
     MAIN.MsgAggregator._data_dir = lambda self: str(data_dir)
-    plugin = MAIN.MsgAggregator(FakeContext(), config or {})
+    plugin = MAIN.MsgAggregator(FakeContext(), config or {}, **kwargs)
     if clock is not None:
         plugin.clock = clock
         plugin.store.clock = clock
@@ -384,18 +407,43 @@ def test_strategy() -> None:
     check("非自适应 = debounce_time", fixed == 2.0, str(fixed))
 
     cfg = MODULE.Config()
+    # 回归用例必须用**真实字符**做 tail_char。v0.9.3 的 bug 正是"只有空串才加成"，
+    # 而空串只出现在整轮没有文本时——用空串当"未完句"的替身会让这个 bug 永远测不出来。
     adaptive = MODULE.strategy.compute(
-        now=100.0, started_at=100.0, text_len=80, tail_char="", short_streak=0,
+        now=100.0, started_at=100.0, text_len=80, tail_char="略", short_streak=0,
         cooldown_remaining=0.0, cfg=cfg,
     )
     check("长文本自适应延长且不超过上限",
           cfg.adaptive_min_wait <= adaptive <= cfg.adaptive_max_wait, str(adaptive))
+
+    unfinished = MODULE.strategy.compute(
+        now=100.0, started_at=100.0, text_len=5, tail_char="略", short_streak=1,
+        cooldown_remaining=0.0, cfg=cfg,
+    )
+    check("短句 + 未完句（真实末字符）= 3.5s，覆盖 2.4~3.9s 的连发间隔",
+          abs(unfinished - 3.5) < 1e-6, str(unfinished))
+
+    open_punct = MODULE.strategy.compute(
+        now=100.0, started_at=100.0, text_len=5, tail_char="，", short_streak=1,
+        cooldown_remaining=0.0, cfg=cfg,
+    )
+    check("句末是逗号时只加 0.5s（3.0s）", abs(open_punct - 3.0) < 1e-6, str(open_punct))
 
     terminal = MODULE.strategy.compute(
         now=100.0, started_at=100.0, text_len=80, tail_char="。", short_streak=0,
         cooldown_remaining=0.0, cfg=cfg,
     )
     check("结尾是句号时比未结尾短（句子已说完）", terminal < adaptive, f"{terminal} < {adaptive}")
+
+    terminal_short = MODULE.strategy.compute(
+        now=100.0, started_at=100.0, text_len=5, tail_char="。", short_streak=1,
+        cooldown_remaining=0.0, cfg=cfg,
+    )
+    check("句号收尾不被未完句加成拖慢（2.1s）",
+          abs(terminal_short - 2.1) < 1e-6, str(terminal_short))
+    check("加成只在非终止标点时出现（略 3.5 > ， 3.0 > 。 2.1）",
+          unfinished > open_punct > terminal_short,
+          f"{unfinished}/{open_punct}/{terminal_short}")
 
     capped = MODULE.strategy.compute(
         now=111.0, started_at=100.0, text_len=80, tail_char="", short_streak=0,
@@ -618,9 +666,15 @@ async def test_web_api(tmp_root: Path) -> None:
     ctx = plugin.context
     MODULE.web_api.register(ctx, plugin)
     routes = [r[0] for r in ctx.web_apis]
-    check("注册了 6 个以上路由", len(ctx.web_apis) >= 6, str(len(ctx.web_apis)))
+    check("注册了 8 个路由", len(ctx.web_apis) == 8, str(len(ctx.web_apis)))
     check("路由以插件名开头",
           all(r.startswith("/astrbot_plugin_msg_aggregator/") for r in routes), str(routes[:2]))
+    check("注册了配置热更新路由",
+          "/astrbot_plugin_msg_aggregator/config" in routes, str(routes))
+    check("热更新白名单收下 debounce_time",
+          "debounce_time" in MODULE.config.HOT_RELOAD_KEYS)
+    check("热更新白名单拒绝 page_enabled（必须重载才生效）",
+          "page_enabled" not in MODULE.config.HOT_RELOAD_KEYS)
 
     # limit 口径
     check("limit 非法整数抛 ValueError", _raises(lambda: MODULE.web_api.parse_limit("abc")))
@@ -634,6 +688,41 @@ async def test_web_api(tmp_root: Path) -> None:
     check("reset 需要确认串", MODULE.web_api.reset_allowed({"confirm": "reset"}))
     check("reset 缺确认串被拒", not MODULE.web_api.reset_allowed({}))
     check("reset 确认串错误被拒", not MODULE.web_api.reset_allowed({"confirm": "RESET"}))
+
+    # 配置热更新接口：白名单 + 写回 + preset 分支（用独立实例，避免污染上面的流程用例）
+    cfg_plugin = make_plugin(tmp_root / "webcfg", {}, clock=clock)
+    cfg_api = MODULE.web_api.PageApi(cfg_plugin)
+    original_request = MODULE.web_api.request
+    try:
+        MODULE.web_api.request = _FakeRequest({"page_enabled": True})
+        rejected = await cfg_api.api_set_config()
+        check("热更新接口拒绝白名单外的键（400）",
+              getattr(rejected, "status_code", None) == 400,
+              str(getattr(rejected, "status_code", None)))
+
+        MODULE.web_api.request = _FakeRequest({"debounce_time": 1.5, "adaptive": False})
+        accepted = await cfg_api.api_set_config()
+        body = json.loads(accepted.body)
+        check("热更新接口立即生效",
+              cfg_plugin.cfg.debounce_time == 1.5 and not cfg_plugin.cfg.adaptive)
+        check("热更新接口写回配置对象",
+              cfg_plugin._config_obj.get("debounce_time") == 1.5,
+              repr(cfg_plugin._config_obj))
+        check("热更新接口回显生效值",
+              body.get("effective", {}).get("debounce_time") == 1.5, str(body))
+
+        MODULE.web_api.request = _FakeRequest({"preset": "patient"})
+        await cfg_api.api_set_config()
+        check("热更新接口可用 preset 切换",
+              cfg_plugin.cfg.preset == "patient" and cfg_plugin.cfg.debounce_time == 3.5,
+              f"{cfg_plugin.cfg.preset}/{cfg_plugin.cfg.debounce_time}")
+
+        MODULE.web_api.request = _FakeRequest({})
+        empty = await cfg_api.api_set_config()
+        check("热更新接口拒绝空 body（400）",
+              getattr(empty, "status_code", None) == 400)
+    finally:
+        MODULE.web_api.request = original_request
 
     # page_enabled=false 不注册
     off_plugin = make_plugin(tmp_root / "off", {"page_enabled": False}, clock=clock)
@@ -677,6 +766,24 @@ def _raises(fn: Any) -> bool:
     except Exception:  # noqa: BLE001
         return True
     return False
+
+
+class _FakeRequest:
+    """替身请求：只提供 `await json(default=...)`。"""
+
+    def __init__(self, payload: Any) -> None:
+        self.payload = payload
+
+    async def json(self, default: Any = None) -> Any:
+        """返回预设的请求体。
+
+        Args:
+            default: 缺省值（本替身不使用）。
+
+        Returns:
+            请求体。
+        """
+        return self.payload
 
 
 async def test_aggregate_flow(tmp_root: Path) -> None:
@@ -899,14 +1006,45 @@ async def test_images(tmp_root: Path) -> None:
 
 
 # ---------------------------------------------------------------- 入口
+def _fake_handler(name: str, priority: Any = None) -> SimpleNamespace:
+    """构造一个够用的 `StarHandlerMetadata` 替身。
+
+    Args:
+        name: handler 名（`StarHandlerMetadata.handler_name`）。
+        priority: 注册时传入的 priority（缺省表示没配）。
+
+    Returns:
+        替身对象。
+    """
+    extras = {} if priority is None else {"priority": priority}
+    return SimpleNamespace(handler_name=name, extras_configs=extras)
+
+
+def _plan(event: FakeEvent, *handlers: Any) -> FakeEvent:
+    """给事件写入"本次派发计划"（`activated_handlers`）。
+
+    Args:
+        event: 事件。
+        *handlers: 派发计划里的 handler（已按优先级降序）。
+
+    Returns:
+        同一个事件（便于链式写）。
+    """
+    event.set_extra("activated_handlers", list(handlers))
+    return event
+
+
 async def test_preemption(tmp_root: Path) -> None:
-    """抢占检测：本该处理却没处理到 → 可见告警，而不是静默不工作。"""
+    """抢占检测：只在"派发计划里有我们、但入口没执行"时报，绝不误报。"""
     print("\n[14] 抢占检测（优先级不足的根源修复）")
     clock = FakeClock()
     plugin = make_plugin(tmp_root / "preempt", {}, clock=clock)
 
     # 正常情况：被处理过的消息绝不误报
-    seen = FakeEvent("正常消息", umo="aiocqhttp:group:p", sender="u1")
+    seen = _plan(
+        FakeEvent("正常消息", umo="aiocqhttp:group:p", sender="u1"),
+        _fake_handler(MAIN.MESSAGE_HANDLER_NAME, MAIN.MESSAGE_PRIORITY),
+    )
     task = asyncio.create_task(plugin.handle(seen))
     await settle()
     plugin.check_preempted(seen)
@@ -915,34 +1053,86 @@ async def test_preemption(tmp_root: Path) -> None:
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
-    # 被抢占：事件从未进入 handle，但走到了 LLM 请求
-    victim = FakeEvent("本该聚合的话", umo="aiocqhttp:group:p", sender="u2")
+    # 被抢占：派发计划里有我们，但入口从未执行
+    victim = _plan(
+        FakeEvent("本该聚合的话", umo="aiocqhttp:group:p", sender="u2"),
+        _fake_handler("handle_session_control_agent", 9223372036854775807),
+        _fake_handler("another_plugin", 100),
+        _fake_handler(MAIN.MESSAGE_HANDLER_NAME, MAIN.MESSAGE_PRIORITY),
+    )
     check("未处理的消息未被标记", not getattr(victim, MAIN.MARKER_ATTR, False))
-    plugin.check_preempted(victim)
+    handlers, index = plugin._dispatch_snapshot(victim)
+    check("派发计划快照给出本插件位置",
+          len(handlers) == 3 and index == 2, f"{len(handlers)}/{index}")
+    check("判定为被抢占并返回 True", plugin.check_preempted(victim) is True)
     check("被抢占时计数 +1", plugin.stats.preempted_total == 1,
           str(plugin.stats.preempted_total))
     plugin.check_preempted(victim)
     check("同一事件重复检测不重复计数（幂等）", plugin.stats.preempted_total == 1,
           str(plugin.stats.preempted_total))
 
-    # 不该处理的消息不能误报
+    # 新判据（v0.9.1）：合成事件没有派发计划 → 不是抢占
+    synthetic = FakeEvent("主动回复/别的插件 request_llm", umo="aiocqhttp:group:p",
+                          sender="u2")
+    check("没有派发计划的合成事件不误报", plugin.check_preempted(synthetic) is False)
+    check("合成事件不计入抢占", plugin.stats.preempted_total == 1,
+          str(plugin.stats.preempted_total))
+
+    foreign = _plan(FakeEvent("别人的派发计划", umo="aiocqhttp:group:p", sender="u2"),
+                    _fake_handler("other_plugin", 50))
+    check("派发计划里没有本插件时不误报", plugin.check_preempted(foreign) is False)
+
+    # 不该处理的消息不能误报（都必须带派发计划，否则测的只是 index<0 的短路）
     before = plugin.stats.preempted_total
-    plugin.check_preempted(FakeEvent("", umo="aiocqhttp:group:p", sender="u3"))
-    check("空消息不误报", plugin.stats.preempted_total == before)
-    plugin.check_preempted(FakeEvent("/help", umo="aiocqhttp:group:p", sender="u3"))
-    check("指令不误报", plugin.stats.preempted_total == before)
-    plugin.check_preempted(
+    own = _fake_handler(MAIN.MESSAGE_HANDLER_NAME, MAIN.MESSAGE_PRIORITY)
+    empty = _plan(FakeEvent("", umo="aiocqhttp:group:p", sender="u3"), own)
+    check("空消息不误报", plugin.check_preempted(empty) is False)
+    command = _plan(FakeEvent("/help", umo="aiocqhttp:group:p", sender="u3"), own)
+    check("指令不误报", plugin.check_preempted(command) is False)
+    notice = _plan(
         FakeEvent("", umo="aiocqhttp:group:p", sender="u3",
                   raw={"post_type": "notice", "notice_type": "input_status",
-                       "event_type": 1})
+                       "event_type": 1}),
+        own,
     )
-    check("通知事件不误报", plugin.stats.preempted_total == before)
+    check("通知事件不误报", plugin.check_preempted(notice) is False)
+    check("以上用例都没有污染计数", plugin.stats.preempted_total == before,
+          f"{plugin.stats.preempted_total} vs {before}")
 
     # 关掉群聊合并后，群消息本就不该处理 → 不误报
     plugin.cfg = MODULE.load_config({"group_enabled": False})
     plugin.store.cfg = plugin.cfg
-    plugin.check_preempted(FakeEvent("群消息", umo="aiocqhttp:group:p", sender="u4"))
-    check("群聊关闭时不误报", plugin.stats.preempted_total == before)
+    group_off = _plan(FakeEvent("群消息", umo="aiocqhttp:group:p", sender="u4"), own)
+    check("群聊关闭时不误报", plugin.check_preempted(group_off) is False)
+
+    # 插件整体关闭时入口本来就不执行（handler 仍在派发计划里），也不能算抢占
+    plugin.cfg = MODULE.load_config({"enabled": False})
+    plugin.store.cfg = plugin.cfg
+    disabled = _plan(FakeEvent("插件关掉了", umo="aiocqhttp:group:p", sender="u5"), own)
+    check("插件整体关闭时不误报", plugin.check_preempted(disabled) is False)
+
+    # 证据字段：告警必须能指认"谁挡在前面"，否则还是猜
+    plugin.cfg = MODULE.load_config({})  # 还原群聊开关，否则下面的群消息会被跳过
+    plugin.store.cfg = plugin.cfg
+    captured: list[tuple[str, dict[str, Any]]] = []
+    original_log = MAIN.log_event
+    MAIN.log_event = lambda name, **kw: captured.append((name, kw))
+    try:
+        blocker = _plan(
+            FakeEvent("证据", umo="aiocqhttp:group:q", sender="u9"),
+            _fake_handler("blocker_a", 2000),
+            _fake_handler("blocker_b", 1500),
+            _fake_handler(MAIN.MESSAGE_HANDLER_NAME, MAIN.MESSAGE_PRIORITY),
+        )
+        plugin.check_preempted(blocker)
+    finally:
+        MAIN.log_event = original_log
+    row = next((kw for name, kw in captured if name == "aggregate.preempted"), {})
+    check("告警带 dispatched / position",
+          row.get("dispatched") == 3 and row.get("position") == 2, str(row))
+    check("告警带 prior（紧挨在前的最多 3 个）",
+          row.get("prior") == "blocker_a@2000,blocker_b@1500",
+          str(row.get("prior")))
 
     # 计数进入统计投影与落盘
     snap = plugin.stats.snapshot(history_limit=0)
@@ -969,9 +1159,73 @@ async def test_preemption(tmp_root: Path) -> None:
         print(f"  [skip] 无法查询注册表：{exc}")
 
 
+class _ConfigWithSave(dict):
+    """模拟 `AstrBotConfig`：dict 子类 + 同步 `save_config()`。"""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.saves = 0
+
+    def save_config(self) -> None:
+        """记录一次落盘。"""
+        self.saves += 1
+
+
+async def test_config_writeback(tmp_root: Path) -> None:
+    """预设写回 + 配置热更新：两者都不能只改内存。"""
+    print("\n[13] 配置写回与热更新")
+    raw = _ConfigWithSave({"preset": "balanced"})
+    plugin = make_plugin(tmp_root / "writeback", raw, clock=FakeClock())
+
+    applied = plugin.apply_preset("patient")
+    check("切预设后内存立即生效",
+          plugin.cfg.preset == "patient" and plugin.cfg.debounce_time == 3.5, str(applied))
+    check("切预设写回配置对象", raw.get("preset") == "patient", repr(raw))
+    check("写回的是显式值（不是只写 preset）",
+          raw.get("debounce_time") == 3.5, repr(dict(raw)))
+    check("写回触发了 save_config()", raw.saves == 1, str(raw.saves))
+    reloaded = MODULE.load_config(raw)
+    check("用写回后的配置重载仍是 patient（v0.1.0 会退回 balanced）",
+          reloaded.preset == "patient" and reloaded.debounce_time == 3.5,
+          f"{reloaded.preset}/{reloaded.debounce_time}")
+
+    # 自定义回调：调用方可以换成自己的落盘方式
+    seen_values: list[dict[str, Any]] = []
+    custom = make_plugin(tmp_root / "custom", {}, clock=FakeClock(),
+                         persist_preset=seen_values.append)
+    custom.apply_preset("fast")
+    check("构造参数 persist_preset 覆盖默认写回",
+          bool(seen_values) and seen_values[-1].get("preset") == "fast",
+          str(seen_values[-1:]))
+
+    # 热更新
+    plugin.apply_config({"debounce_time": 1.2, "adaptive": False})
+    check("热更新立即生效",
+          plugin.cfg.debounce_time == 1.2 and not plugin.cfg.adaptive,
+          f"{plugin.cfg.debounce_time}/{plugin.cfg.adaptive}")
+    check("热更新挂到 store / stats / attachments（不会各用各的）",
+          plugin.store.cfg is plugin.cfg and plugin.stats.cfg is plugin.cfg
+          and plugin.attachments.cfg is plugin.cfg)
+    check("热更新默认只改内存（不写回）", raw.get("debounce_time") == 3.5,
+          repr(raw.get("debounce_time")))
+
+    plugin.apply_config({"debounce_time": 1.5}, persist=True)
+    check("persist=True 时写回配置对象", raw.get("debounce_time") == 1.5,
+          repr(raw.get("debounce_time")))
+    check("persist=True 也触发 save_config()", raw.saves == 2, str(raw.saves))
+
+    plugin.apply_config({"debounce_time": 0})
+    check("热更新非法值按 validate 回退（不是抛异常）",
+          plugin.cfg.debounce_time == 2.0, str(plugin.cfg.debounce_time))
+
+    plugin.apply_config(None)
+    check("apply_config(None) 按当前配置对象重算，不炸",
+          plugin.cfg.debounce_time > 0, str(plugin.cfg.debounce_time))
+
+
 def test_metadata() -> None:
     """`metadata.yaml` 必须能被 AstrBot 解析，且关键字段齐全。"""
-    print("\n[13] 元信息")
+    print("\n[15] 元信息")
     try:
         import yaml  # AstrBot 自带 PyYAML
     except Exception:  # noqa: BLE001 - 没有 yaml 就跳过（不影响核心用例）
@@ -1050,6 +1304,7 @@ async def main() -> int:
         await test_typing_and_recall(tmp_root)
         await test_images(tmp_root)
         await test_shutdown(tmp_root)
+        await test_config_writeback(tmp_root)
         await test_preemption(tmp_root)
         test_metadata()
     except Exception:  # noqa: BLE001 - 测试脚本自身出错要显式报出来
